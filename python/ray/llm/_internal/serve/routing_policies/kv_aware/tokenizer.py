@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
 import jinja2
@@ -18,6 +19,20 @@ from ray.llm._internal.serve.engines.vllm.vllm_engine import (
 from ray.llm._internal.serve.observability.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@contextmanager
+def _use_cpu_device():
+    """Resolve vLLM's device to CPU: the tokenizer's ingress replica has no
+    accelerator, and config resolution otherwise fails without one."""
+    from vllm.platforms import current_platform
+
+    # device_type is a class attribute; shadow it, then drop to restore.
+    current_platform.device_type = "cpu"
+    try:
+        yield
+    finally:
+        current_platform.__dict__.pop("device_type", None)
 
 
 class TokenizeError(Exception):
@@ -88,7 +103,8 @@ class Tokenizer:
 
     def __init__(self, llm_config: LLMConfig):
         engine_config = llm_config.get_engine_config()
-        _, vllm_config = _get_vllm_engine_config(llm_config)
+        with _use_cpu_device():
+            _, vllm_config = _get_vllm_engine_config(llm_config)
         self._model_config = vllm_config.model_config
 
         frontend_args = FrontendArgs(**engine_config.frontend_kwargs)
