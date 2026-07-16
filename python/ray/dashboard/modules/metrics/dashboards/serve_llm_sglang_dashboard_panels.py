@@ -24,6 +24,12 @@ _SGLANG_FILTER = (
 # Filter for ray_serve_* metrics (they have no model_name label).
 _SERVE_FILTER = 'WorkerId=~"$workerid", deployment=~"$deployment", {global_filters}'
 
+# Filter for scheduler metrics, which carry deployment/replica natively (from
+# SGLangServer's extra_metric_labels), so they support the deployment dropdown.
+_SCHED_FILTER = (
+    'model_name=~"$sglang_model_name", deployment=~"$deployment", {global_filters}'
+)
+
 # Grafts Serve `deployment` onto tokenizer_manager series via the shared replica
 # WorkerId. Tokenizer metrics only -- scheduler workers have no matching counter.
 _DEP_JOIN_SRC = (
@@ -34,7 +40,6 @@ _DEP_JOIN_SRC = (
 # Legends: SGLang panels key on WorkerId; the Serve requests panel on deployment/replica.
 _WORKER = "{{WorkerId}}"
 _DEP_REPLICA = "{{deployment}}: {{replica}}"
-_DEPLOYMENT = "{{deployment}}"
 
 
 def _mean_with_join(metric_base: str) -> str:
@@ -83,34 +88,39 @@ def _rate_with_join(metric: str, agg_fn: str = "rate") -> str:
     )
 
 
+def _gauge_by_dep_replica(metric: str) -> str:
+    """Gauge grouped by deployment/replica (scheduler metrics carry them natively)."""
+    return f"sum by(deployment, replica) ({metric}{{{{{_SCHED_FILTER}}}}})"
+
+
 def _mean_by_deployment(metric_base: str) -> str:
-    """Mean per Serve deployment (WorkerId->deployment join; tokenizer metrics only)."""
+    """Mean per deployment/replica (WorkerId join; tokenizer metrics only)."""
     return (
         "(\n"
         "  (\n"
-        f"    sum by(deployment) (rate({metric_base}_sum{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment) ({_DEP_JOIN_SRC}))\n"
+        f"    sum by(deployment, replica) (rate({metric_base}_sum{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment, replica) ({_DEP_JOIN_SRC}))\n"
         "    /\n"
-        f"    sum by(deployment) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment) ({_DEP_JOIN_SRC}))\n"
+        f"    sum by(deployment, replica) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment, replica) ({_DEP_JOIN_SRC}))\n"
         "  )\n"
-        "  and on(deployment)\n"
+        "  and on(deployment, replica)\n"
         "  (\n"
-        f"    sum by(deployment) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment) ({_DEP_JOIN_SRC})) > 0\n"
+        f"    sum by(deployment, replica) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment, replica) ({_DEP_JOIN_SRC})) > 0\n"
         "  )\n"
         ")"
     )
 
 
 def _percentile_by_deployment(metric_base: str, quantile: float) -> str:
-    """Percentile per Serve deployment (WorkerId->deployment join; tokenizer metrics only)."""
+    """Percentile per deployment/replica (WorkerId join; tokenizer metrics only)."""
     return (
         "(\n"
         "  histogram_quantile(\n"
         f"    {quantile},\n"
-        f"    sum by (le, deployment) (rate({metric_base}_bucket{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment) ({_DEP_JOIN_SRC}))\n"
+        f"    sum by (le, deployment, replica) (rate({metric_base}_bucket{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment, replica) ({_DEP_JOIN_SRC}))\n"
         "  )\n"
-        "  and on(deployment)\n"
+        "  and on(deployment, replica)\n"
         "  (\n"
-        f"    sum by(deployment) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment) ({_DEP_JOIN_SRC})) > 0\n"
+        f"    sum by(deployment, replica) (rate({metric_base}_count{{{{{_SGLANG_FILTER}}}}}[$interval]) * on(WorkerId) group_left(deployment, replica) ({_DEP_JOIN_SRC})) > 0\n"
         "  )\n"
         ")"
     )
@@ -133,7 +143,7 @@ def _histogram_panels(
     by Serve deployment (tokenizer metrics only)."""
     mean_fn = _mean_by_deployment if by_deployment else _mean_with_join
     pct_fn = _percentile_by_deployment if by_deployment else _percentile_with_join
-    legend = _DEPLOYMENT if by_deployment else _WORKER
+    legend = _DEP_REPLICA if by_deployment else _WORKER
     return [
         Panel(
             id=ids[0],
@@ -151,11 +161,7 @@ def _histogram_panels(
             title=f"{label} -- P50",
             description=description,
             unit=unit,
-            targets=[
-                Target(
-                    expr=pct_fn(metric_base, 0.5), legend=legend
-                )
-            ],
+            targets=[Target(expr=pct_fn(metric_base, 0.5), legend=legend)],
             fill=1,
             linewidth=linewidth,
             stack=False,
@@ -166,11 +172,7 @@ def _histogram_panels(
             title=f"{label} -- P90",
             description=description,
             unit=unit,
-            targets=[
-                Target(
-                    expr=pct_fn(metric_base, 0.9), legend=legend
-                )
-            ],
+            targets=[Target(expr=pct_fn(metric_base, 0.9), legend=legend)],
             fill=1,
             linewidth=linewidth,
             stack=False,
@@ -284,8 +286,8 @@ _cache_panels = [
         unit="percentunit",
         targets=[
             Target(
-                expr=_gauge_with_join("ray_sglang_token_usage"),
-                legend=_WORKER,
+                expr=_gauge_by_dep_replica("ray_sglang_token_usage"),
+                legend=_DEP_REPLICA,
             ),
         ],
         fill=1,
@@ -300,8 +302,8 @@ _cache_panels = [
         unit="percentunit",
         targets=[
             Target(
-                expr=_gauge_with_join("ray_sglang_cache_hit_rate"),
-                legend=_WORKER,
+                expr=_gauge_by_dep_replica("ray_sglang_cache_hit_rate"),
+                legend=_DEP_REPLICA,
             ),
         ],
         fill=1,
